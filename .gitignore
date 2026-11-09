@@ -1,0 +1,7 @@
+tools/
+dist/
+reference/
+.zig-cache/
+config-test.ini*
+layout-delete-test.ini*
+test-host/
