@@ -9,10 +9,10 @@ int main() {
     FreeLibrary(dll);
     wchar_t full[MAX_PATH]; GetFullPathNameW(L"config-test.ini",MAX_PATH,full,nullptr);
     std::wstring path=full, decoded;
-    std::vector<Entry> input={{L" 中文关键词 ",L"中文描述"},{L"\\d+\\s+\"quoted\"",L"首尾空格 \t\r\n"},{L"'quote;=中文",L""}};
+    std::vector<Entry> input={{L" 中文关键词 ",L"中文描述",L"日志",L"网络, error"},{L"\\d+\\s+\"quoted\"",L"首尾空格 \t\r\n"},{L"'quote;=中文",L""}};
     assert(save(path,input)); std::vector<Entry> output;
     assert(load(path,output)); assert(output.size()==input.size());
-    for(size_t i=0;i<input.size();i++) { assert(input[i].keyword==output[i].keyword); assert(input[i].description==output[i].description); }
+    for(size_t i=0;i<input.size();i++) { assert(input[i].keyword==output[i].keyword); assert(input[i].description==output[i].description);assert(input[i].category==output[i].category && input[i].tags==output[i].tags); }
     assert(!decode(L"v:broken\\",decoded));
     assert(!save(L"missing-directory\\test.ini",input));
     WritePrivateProfileStringW(L"SearchShelf",L"count",L"1001",path.c_str());
@@ -40,5 +40,10 @@ int main() {
     assert(importEntries({},false)==ImportResult::Success && entries.size()==2);
     assert(importEntries({},true)==ImportResult::Success && entries.empty());
     assert(load(config,output) && output.empty());
-    DeleteFileW(path.c_str()); std::cout<<"PASS: DLL/config; append keeps existing and deduplicates incoming; replace drops old; write/limit failures preserve data; empty imports\n";
+    assert(save(path,input));WritePrivateProfileStringW(L"SearchShelf",L"version",L"1",path.c_str());
+    assert(load(path,output) && output[0].category.empty() && output[0].tags.empty());
+    assert(save(path,input)); assert(read(path+L".v1.bak",L"SearchShelf",L"version")==L"1");
+    assert(load(path,output) && output[0].category==L"日志" && output[0].tags==L"网络, error");
+    DeleteFileW((path+L".v1.bak").c_str());
+    DeleteFileW(path.c_str()); std::cout<<"PASS: metadata round trip and v1 upgrade backup; DLL/config/import and failure regressions\n";
 }

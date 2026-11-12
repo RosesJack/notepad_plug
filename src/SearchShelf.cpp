@@ -13,7 +13,7 @@
 struct NppData { HWND npp, mainView, secondView; };
 struct ShortcutKey { bool ctrl, alt, shift; UCHAR key; };
 struct FuncItem { wchar_t name[64]; void (__cdecl *fn)(); int id; bool checked; ShortcutKey* key; };
-struct Entry { std::wstring keyword, description; };
+struct Entry { std::wstring keyword, description, category, tags; };
 static HINSTANCE module;
 static NppData host{};
 static HWND dialog, panel, choices, description;
@@ -23,6 +23,7 @@ static UINT_PTR timerId;
 static std::wstring config;
 static std::vector<Entry> entries;
 static std::vector<int> visibleRows;
+static std::vector<std::wstring> categories;
 static bool inside;
 static bool shelfExpanded=true;
 static int nativeMinimumHeight=0, expandedShelfPixels=0;
@@ -90,11 +91,14 @@ static void syncAppearance() {
 static void error(const wchar_t* s) { MessageBoxW(dialog?dialog:host.npp,s,L"搜索收藏",MB_OK|MB_ICONERROR); }
 static std::wstring read(const std::wstring& path,const wchar_t* section,const wchar_t* key) { std::vector<wchar_t> b(32768); GetPrivateProfileStringW(section,key,L"",b.data(),(DWORD)b.size(),path.c_str()); return b.data(); }
 static bool load(const std::wstring& path,std::vector<Entry>& out) {
-    if(read(path,L"SearchShelf",L"version")!=L"1") return false;
+    auto version=read(path,L"SearchShelf",L"version");
+    if(version!=L"1" && version!=L"2") return false;
     auto count=read(path,L"SearchShelf",L"count"); wchar_t* end=nullptr; long n=wcstol(count.c_str(),&end,10);
     if(count.empty() || *end || n<0 || n>1000) return false;
     std::vector<Entry> result;
-    for(int i=0;i<n;i++) { auto section=L"Item"+std::to_wstring(i); Entry e; if(!decode(read(path,section.c_str(),L"keyword"),e.keyword) || !decode(read(path,section.c_str(),L"description"),e.description) || e.keyword.empty() || e.keyword.size()>4096 || e.description.size()>512) return false; result.push_back(e); }
+    for(int i=0;i<n;i++) { auto section=L"Item"+std::to_wstring(i); Entry e; if(!decode(read(path,section.c_str(),L"keyword"),e.keyword) || !decode(read(path,section.c_str(),L"description"),e.description) || e.keyword.empty() || e.keyword.size()>4096 || e.description.size()>512) return false;
+        if(version==L"2" && (!decode(read(path,section.c_str(),L"category"),e.category) || !decode(read(path,section.c_str(),L"tags"),e.tags) || e.category.size()>128 || e.tags.size()>512)) return false;
+        result.push_back(e); }
     out=std::move(result); return true;
 }
 static bool save(const std::wstring& path,const std::vector<Entry>& data) {
@@ -103,9 +107,10 @@ static bool save(const std::wstring& path,const std::vector<Entry>& data) {
     if(f==INVALID_HANDLE_VALUE) return false;
     WORD bom=0xfeff; DWORD wrote; bool ok=WriteFile(f,&bom,2,&wrote,nullptr)!=0; CloseHandle(f);
     auto put=[&](const wchar_t* section,const wchar_t* key,const std::wstring& value) { if(!WritePrivateProfileStringW(section,key,value.c_str(),tmp.c_str())) ok=false; };
-    put(L"SearchShelf",L"version",L"1"); put(L"SearchShelf",L"count",std::to_wstring(data.size()));
-    for(size_t i=0;i<data.size();i++) { auto section=L"Item"+std::to_wstring(i); put(section.c_str(),L"keyword",encode(data[i].keyword)); put(section.c_str(),L"description",encode(data[i].description)); }
+    put(L"SearchShelf",L"version",L"2"); put(L"SearchShelf",L"count",std::to_wstring(data.size()));
+    for(size_t i=0;i<data.size();i++) { auto section=L"Item"+std::to_wstring(i); put(section.c_str(),L"keyword",encode(data[i].keyword)); put(section.c_str(),L"description",encode(data[i].description)); put(section.c_str(),L"category",encode(data[i].category)); put(section.c_str(),L"tags",encode(data[i].tags)); }
     WritePrivateProfileStringW(nullptr,nullptr,nullptr,tmp.c_str());
+    if(ok && path==config && read(path,L"SearchShelf",L"version")==L"1" && GetFileAttributesW((path+L".v1.bak").c_str())==INVALID_FILE_ATTRIBUTES) ok=CopyFileW(path.c_str(),(path+L".v1.bak").c_str(),TRUE)!=FALSE;
     if(ok) ok=MoveFileExW(tmp.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0;
     if(!ok) DeleteFileW(tmp.c_str()); return ok;
 }
@@ -115,18 +120,36 @@ static bool contains(const std::wstring& value,const std::wstring& query) {
 static int sourceRow(int row) {
     return row>=0 && row<(int)visibleRows.size()?visibleRows[row]:-1;
 }
+static void rebuildCategories() {
+    HWND combo=GetDlgItem(panel,33); if(!combo) return;
+    int old=(int)SendMessageW(combo,CB_GETCURSEL,0,0); auto current=text(combo);
+    categories.clear();
+    for(auto& e:entries) if(!e.category.empty() && std::find(categories.begin(),categories.end(),e.category)==categories.end()) categories.push_back(e.category);
+    std::sort(categories.begin(),categories.end());
+    SendMessageW(combo,CB_RESETCONTENT,0,0);
+    SendMessageW(combo,CB_ADDSTRING,0,(LPARAM)L"全部分类"); SendMessageW(combo,CB_ADDSTRING,0,(LPARAM)L"未分类");
+    int selected=old==1?1:0;
+    for(size_t i=0;i<categories.size();++i) { SendMessageW(combo,CB_ADDSTRING,0,(LPARAM)categories[i].c_str()); if(old>=2 && categories[i]==current) selected=(int)i+2; }
+    SendMessageW(combo,CB_SETCURSEL,selected,0);
+}
 static void refresh(int selected=-1) {
+    rebuildCategories();
+    int categoryIndex=(int)SendMessageW(GetDlgItem(panel,33),CB_GETCURSEL,0,0);
+    auto categoryFilter=text(GetDlgItem(panel,33));
     auto keywordFilter=text(GetDlgItem(panel,30)), descriptionFilter=text(GetDlgItem(panel,31));
     ListView_DeleteAllItems(choices);
     visibleRows.clear();
     int selectedVisible=-1;
     for(size_t i=0;i<entries.size();++i) {
+        if(categoryIndex==1 && !entries[i].category.empty()) continue;
+        if(categoryIndex>=2 && entries[i].category!=categoryFilter) continue;
         if(!contains(entries[i].keyword,keywordFilter) || !contains(entries[i].description,descriptionFilter)) continue;
         int row=(int)visibleRows.size(); visibleRows.push_back((int)i);
         if((int)i==selected) selectedVisible=row;
         LVITEMW item{}; item.mask=LVIF_TEXT; item.iItem=row; item.pszText=entries[i].keyword.data();
         ListView_InsertItem(choices,&item);
         ListView_SetItemText(choices,row,1,entries[i].description.data());
+        ListView_SetItemText(choices,row,2,entries[i].category.data());
     }
     if(selectedVisible>=0) { ListView_SetItemState(choices,selectedVisible,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED); ListView_EnsureVisible(choices,selectedVisible,FALSE); }
     auto count=L"显示 "+std::to_wstring(visibleRows.size())+L" / "+std::to_wstring(entries.size());
@@ -197,6 +220,71 @@ static void transfer(bool importing) {
     if(result==ImportResult::TooManyEntries) error(L"最多支持 1000 条收藏，未更改现有收藏。");
     if(result==ImportResult::SaveFailed) error(L"保存失败，未更改现有收藏。");
 }
+static std::wstring trim(const std::wstring& s) {
+    auto first=s.find_first_not_of(L" \t\r\n"); return first==std::wstring::npos?L"":s.substr(first,s.find_last_not_of(L" \t\r\n")-first+1);
+}
+enum class EditResult { Success, Invalid, Duplicate, SaveFailed };
+static EditResult editEntry(int index,Entry updated) {
+    updated.category=trim(updated.category);
+    if(index<0 || index>=(int)entries.size() || updated.keyword.empty() || updated.keyword.size()>4096 || updated.description.size()>512 || updated.category.size()>128) return EditResult::Invalid;
+    updated.tags=entries[index].tags; // Preserve legacy metadata without exposing a tag feature.
+    for(size_t i=0;i<entries.size();++i) if((int)i!=index && entries[i].keyword==updated.keyword) return EditResult::Duplicate;
+    auto next=entries; auto oldKeyword=next[index].keyword; next[index]=updated;
+    if(!save(config,next)) return EditResult::SaveFailed;
+    entries=std::move(next); refresh(index);
+    if(text(GetDlgItem(dialog,FIND))==oldKeyword) {
+        SetWindowTextW(GetDlgItem(dialog,FIND),updated.keyword.c_str());SetWindowTextW(description,updated.description.c_str());
+        SendMessageW(dialog,WM_COMMAND,MAKEWPARAM(FIND,CBN_EDITCHANGE),(LPARAM)GetDlgItem(dialog,FIND));
+    }
+    return EditResult::Success;
+}
+static INT_PTR CALLBACK editDialogProc(HWND w,UINT m,WPARAM wp,LPARAM lp) {
+    if(m==WM_INITDIALOG) {
+        int index=(int)lp; SetWindowLongPtrW(w,DWLP_USER,index); SetWindowTextW(w,L"编辑收藏");
+        RECT r{};GetClientRect(w,&r); int gap=scale(10), label=scale(65), line=(r.bottom-3*gap-scale(30))/3;
+        HFONT font=(HFONT)SendMessageW(GetDlgItem(dialog,1625),WM_GETFONT,0,0);
+        if(!font)font=(HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        auto make=[&](const wchar_t* cls,const wchar_t* value,DWORD style,int id,int x,int y,int width,int height) {
+            HWND child=CreateWindowExW(0,cls,value,WS_CHILD|WS_VISIBLE|style,x,y,width,height,w,(HMENU)(INT_PTR)id,module,nullptr);
+            SendMessageW(child,WM_SETFONT,(WPARAM)font,TRUE);return child;
+        };
+        const wchar_t* labels[]={L"关键词",L"描述",L"分类"};
+        const std::wstring* values[]={&entries[index].keyword,&entries[index].description,&entries[index].category};
+        int limits[]={4096,512,128};
+        for(int i=0;i<3;i++) {
+            int y=gap+i*line;
+            make(L"STATIC",labels[i],SS_LEFT,200+i,gap,y,label,line-gap);
+            DWORD style=WS_TABSTOP|WS_BORDER|ES_AUTOHSCROLL;
+            if(i<2)style=WS_TABSTOP|WS_BORDER|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL;
+            HWND field=make(i==2?L"COMBOBOX":L"EDIT",i==2?L"":values[i]->c_str(),i==2?(WS_TABSTOP|CBS_DROPDOWN|WS_VSCROLL):style,100+i,gap+label,y,r.right-3*gap-label,i==2?scale(180):(i<2?line-gap:scale(24)));
+            if(i==2) { for(auto& c:categories)SendMessageW(field,CB_ADDSTRING,0,(LPARAM)c.c_str()); SendMessageW(field,CB_LIMITTEXT,limits[i],0);SetWindowTextW(field,values[i]->c_str()); }
+            else SendMessageW(field,EM_SETLIMITTEXT,limits[i],0);
+        }
+        make(L"BUTTON",L"保存修改",WS_TABSTOP|BS_DEFPUSHBUTTON,IDOK,r.right-scale(180),r.bottom-scale(36),scale(80),scale(26));
+        make(L"BUTTON",L"取消",WS_TABSTOP|BS_PUSHBUTTON,IDCANCEL,r.right-scale(90),r.bottom-scale(36),scale(80),scale(26));
+        SendMessageW(host.npp,WM_USER+1000+112,0xB,(LPARAM)w);
+        RECT owner{};GetWindowRect(dialog,&owner);RECT bounds{};GetWindowRect(w,&bounds);
+        SetWindowPos(w,nullptr,std::max(0L,owner.left+(owner.right-owner.left-(bounds.right-bounds.left))/2),std::max(0L,owner.top+(owner.bottom-owner.top-(bounds.bottom-bounds.top))/2),0,0,SWP_NOSIZE|SWP_NOZORDER);
+        SetFocus(GetDlgItem(w,100));return FALSE;
+    }
+    if(m==WM_COMMAND && LOWORD(wp)==IDOK) {
+        Entry e{text(GetDlgItem(w,100)),text(GetDlgItem(w,101)),text(GetDlgItem(w,102))};
+        auto result=editEntry((int)GetWindowLongPtrW(w,DWLP_USER),e);
+        if(result==EditResult::Success)EndDialog(w,IDOK);
+        else MessageBoxW(w,result==EditResult::Duplicate?L"该关键词已存在，请更换关键词，原收藏未修改。":result==EditResult::SaveFailed?L"保存失败，原收藏未修改。":L"请检查关键词和字段长度，关键词不能为空。",L"编辑收藏",MB_OK|MB_ICONWARNING);
+        return TRUE;
+    }
+    if(m==WM_CLOSE || (m==WM_COMMAND && LOWORD(wp)==IDCANCEL)) {EndDialog(w,IDCANCEL);return TRUE;}
+    return FALSE;
+}
+static void editSelected() {
+    auto selected=selectedRows();
+    if(selected.size()!=1) {error(L"请仅选中一条收藏后编辑。");return;}
+    struct {DLGTEMPLATE dialog; WORD menu,cls,title;} layout{};
+    layout.dialog.style=WS_POPUP|WS_CAPTION|WS_SYSMENU|DS_MODALFRAME;
+    layout.dialog.dwExtendedStyle=WS_EX_CONTROLPARENT;layout.dialog.cx=360;layout.dialog.cy=175;
+    if(DialogBoxIndirectParamW(module,&layout.dialog,dialog,editDialogProc,selected[0])==-1)error(L"无法打开编辑窗口。");
+}
 static LRESULT CALLBACK panelProc(HWND w,UINT m,WPARAM wp,LPARAM lp) {
     if(m==WM_ERASEBKGND && panelBrush) {
         RECT client{}; GetClientRect(w,&client); FillRect((HDC)wp,&client,panelBrush); return TRUE;
@@ -208,6 +296,14 @@ static LRESULT CALLBACK panelProc(HWND w,UINT m,WPARAM wp,LPARAM lp) {
         return SendMessageW(dialog,m,wp,lp);
     if(m==WM_NOTIFY && lp) {
         auto* notification=reinterpret_cast<NMHDR*>(lp);
+        if(notification->hwndFrom==choices && notification->code==LVN_KEYDOWN && reinterpret_cast<NMLVKEYDOWN*>(lp)->wVKey==VK_F2) {editSelected();return 0;}
+        if(notification->hwndFrom==choices && notification->code==NM_RCLICK) {
+            int row=reinterpret_cast<NMITEMACTIVATE*>(lp)->iItem;
+            if(row>=0 && !(ListView_GetItemState(choices,row,LVIS_SELECTED)&LVIS_SELECTED)) {ListView_SetItemState(choices,-1,0,LVIS_SELECTED);ListView_SetItemState(choices,row,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);}
+            HMENU menu=CreatePopupMenu();AppendMenuW(menu,MF_STRING|(row<0 || selectedRows().size()!=1?MF_GRAYED:0),1,L"编辑收藏…\tF2");
+            POINT point{};GetCursorPos(&point);int command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,0,w,nullptr);DestroyMenu(menu);
+            if(command==1)editSelected();return 0;
+        }
         if(notification->hwndFrom==choices && notification->code==NM_DBLCLK) {
             // Use the double-clicked row, not the first row in a multi-selection.
             int selected=sourceRow(reinterpret_cast<NMITEMACTIVATE*>(lp)->iItem);
@@ -222,7 +318,10 @@ static LRESULT CALLBACK panelProc(HWND w,UINT m,WPARAM wp,LPARAM lp) {
     if(m==WM_COMMAND) {
         int id=LOWORD(wp);
         if((id==30 || id==31) && HIWORD(wp)==EN_CHANGE) { refresh(); return 0; }
+        if(id==33 && HIWORD(wp)==CBN_SELCHANGE) {refresh();return 0;}
+        if(id==17) {editSelected();return 0;}
         if(id==32 && HIWORD(wp)==BN_CLICKED) {
+            SendMessageW(GetDlgItem(w,33),CB_SETCURSEL,0,0);
             SetWindowTextW(GetDlgItem(w,30),L""); SetWindowTextW(GetDlgItem(w,31),L"");
             refresh(); return 0;
         }
@@ -231,7 +330,7 @@ static LRESULT CALLBACK panelProc(HWND w,UINT m,WPARAM wp,LPARAM lp) {
             if(e.keyword.empty()) { error(L"请先在原搜索框输入关键词。"); return 0; }
             if(e.keyword.size()>4096) { error(L"关键词最多支持 4096 字。"); return 0; }
             auto updated=entries; auto it=std::find_if(updated.begin(),updated.end(),[&](auto& x){return x.keyword==e.keyword;});
-            int index=(int)(it-updated.begin()); if(it!=updated.end()) *it=e; else { if(updated.size()>=1000) {error(L"最多支持 1000 条收藏。"); return 0;} updated.push_back(e); }
+            int index=(int)(it-updated.begin()); if(it!=updated.end()) it->description=e.description; else { if(updated.size()>=1000) {error(L"最多支持 1000 条收藏。"); return 0;} updated.push_back(e); }
             if(save(config,updated)) { entries=std::move(updated); refresh(index); } else error(L"保存失败，请检查配置目录权限。");
         }
         if(id==13) {
@@ -274,17 +373,20 @@ static void layout() {
     position(GetDlgItem(panel,20),0,0,width-scale(200),header,true);
     position(GetDlgItem(panel,23),width-scale(196),0,scale(108),header,true);
     position(GetDlgItem(panel,32),width-scale(80),0,scale(80),scale(22),true);
-    int split=width*65/100;
+    int split=width*40/100, categoryLeft=width*75/100;
     position(GetDlgItem(panel,30),0,header,split-gap/2,line,true);
-    position(GetDlgItem(panel,31),split+gap/2,header,width-split-gap/2,line,true);
+    position(GetDlgItem(panel,31),split+gap/2,header,categoryLeft-split-gap,line,true);
+    position(GetDlgItem(panel,33),categoryLeft+gap/2,header,width-categoryLeft-gap/2,scale(240),true);
     position(choices,0,listTop,width,body,true);
-    int bottom=listTop+body+gap, button=scale(52), buttons=4*(button+gap);
+    int bottom=listTop+body+gap, button=scale(44), buttons=5*(button+gap);
     position(GetDlgItem(panel,22),0,bottom,scale(36),line,true);
     position(description,scale(40),bottom,std::max(scale(60),width-scale(40)-buttons),line,true);
-    for(int i=0;i<4;i++) position(GetDlgItem(panel,12+i),width-buttons+gap+i*(button+gap),bottom,button,line,true);
+    int buttonIds[]={12,17,13,14,15};
+    for(int i=0;i<5;i++) position(GetDlgItem(panel,buttonIds[i]),width-buttons+gap+i*(button+gap),bottom,button,line,true);
     int usable=width-GetSystemMetrics(SM_CXVSCROLL)-scale(4);
-    ListView_SetColumnWidth(choices,0,std::max(scale(180),usable*65/100));
-    ListView_SetColumnWidth(choices,1,std::max(scale(140),usable-usable*65/100));
+    ListView_SetColumnWidth(choices,0,std::max(scale(180),usable*50/100));
+    ListView_SetColumnWidth(choices,1,std::max(scale(120),usable*30/100));
+    ListView_SetColumnWidth(choices,2,std::max(scale(80),usable*20/100));
 }
 static bool needsLayout(UINT m, WPARAM wp, LPARAM lp) {
     if(m==WM_SIZE) return wp!=SIZE_MINIMIZED;
@@ -377,6 +479,7 @@ static BOOL CALLBACK discover(HWND w,LPARAM) {
     ListView_SetExtendedListViewStyle(choices,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER);
     LVCOLUMNW column{}; column.mask=LVCF_TEXT|LVCF_WIDTH; column.cx=scale(180); column.pszText=(LPWSTR)L"关键词"; ListView_InsertColumn(choices,0,&column);
     column.pszText=(LPWSTR)L"描述"; ListView_InsertColumn(choices,1,&column);
+    column.pszText=(LPWSTR)L"分类"; ListView_InsertColumn(choices,2,&column);
     make(L"STATIC",L"关键词收藏（双击填入；Ctrl / Shift 多选删除）",SS_LEFT,20);
     make(L"STATIC",L"",SS_LEFT,23);
     make(L"BUTTON",L"清除筛选",BS_PUSHBUTTON,32);
@@ -385,9 +488,10 @@ static BOOL CALLBACK discover(HWND w,LPARAM) {
     SendMessageW(keywordFilter,EM_SETCUEBANNER,TRUE,(LPARAM)L"筛选关键词：输入部分内容");
     SendMessageW(descriptionFilter,EM_SETCUEBANNER,TRUE,(LPARAM)L"筛选描述：输入部分内容");
     SendMessageW(keywordFilter,EM_SETLIMITTEXT,4096,0); SendMessageW(descriptionFilter,EM_SETLIMITTEXT,512,0);
+    make(L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_VSCROLL,33);
     make(L"STATIC",L"描述",SS_LEFT,22);
     description=make(L"EDIT",L"",WS_BORDER|ES_AUTOHSCROLL,11); SendMessageW(description,EM_SETCUEBANNER,0,(LPARAM)L"收藏描述"); SendMessageW(description,EM_SETLIMITTEXT,512,0);
-    make(L"BUTTON",L"保存",BS_PUSHBUTTON,12); make(L"BUTTON",L"删除",BS_PUSHBUTTON,13); make(L"BUTTON",L"导入",BS_PUSHBUTTON,14); make(L"BUTTON",L"导出",BS_PUSHBUTTON,15);
+    make(L"BUTTON",L"编辑",BS_PUSHBUTTON,17);make(L"BUTTON",L"保存",BS_PUSHBUTTON,12); make(L"BUTTON",L"删除",BS_PUSHBUTTON,13); make(L"BUTTON",L"导入",BS_PUSHBUTTON,14); make(L"BUTTON",L"导出",BS_PUSHBUTTON,15);
     SendMessageW(host.npp,WM_USER+1000+112,0xB,(LPARAM)panel);
     syncAppearance();
     SetWindowSubclass(w,dialogProc,1,0);

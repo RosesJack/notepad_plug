@@ -5,6 +5,30 @@
 static int moves=0, redrawSuspensions=0;
 static int nativeHeight=420;
 static int nativeCollapseCommands=0;
+static HWND editOwner;
+static bool cancelModal=false;
+static void CALLBACK completeTestEditor(HWND,UINT,UINT_PTR timer,DWORD) {
+    static int attempts=0;
+    HWND editor=nullptr;
+    EnumThreadWindows(GetCurrentThreadId(),[](HWND candidate,LPARAM target)->BOOL {
+        if(GetWindow(candidate,GW_OWNER)==editOwner && GetDlgItem(candidate,100)) {*(HWND*)target=candidate;return FALSE;}return TRUE;
+    },(LPARAM)&editor);
+    if(!editor || editor==editOwner || !GetDlgItem(editor,100)) {
+        if(++attempts>250) {
+            EnumThreadWindows(GetCurrentThreadId(),[](HWND candidate,LPARAM)->BOOL {wchar_t title[128]{};GetWindowTextW(candidate,title,128);std::wcerr<<L"TEST WINDOW: "<<title<<L" owner="<<GetWindow(candidate,GW_OWNER)<<L"\n";return TRUE;},0);
+            std::cerr<<"Editor failed to open within 5 seconds\n";ExitProcess(2);
+        }
+        return;
+    }
+    attempts=0;
+    KillTimer(nullptr,timer);
+    assert(!GetDlgItem(editor,103) && !GetDlgItem(editor,203));
+    RECT categoryRect=rect(GetDlgItem(editor,102),editor), saveRect=rect(GetDlgItem(editor,IDOK),editor);
+    assert(categoryRect.bottom<=saveRect.top);
+    SetWindowTextW(GetDlgItem(editor,100),cancelModal?L"cancelled-key":L"modal-renamed");
+    SetWindowTextW(GetDlgItem(editor,102),L"弹框分类");
+    SendMessageW(editor,WM_COMMAND,cancelModal?IDCANCEL:IDOK,0);
+}
 static LRESULT CALLBACK nativeHost(HWND w,UINT m,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR) {
     if(m==WM_COMMAND && LOWORD(wp)==1640) {
         ++nativeCollapseCommands;
@@ -153,7 +177,33 @@ int main() {
     assert(visibleRows.empty() && entries.size()==3 && entries[2].description==L"新描述");
     SendMessageW(panel,WM_COMMAND,MAKEWPARAM(32,BN_CLICKED),0);
     assert(visibleRows.size()==3); DeleteFileW(config.c_str());
+    entries={{L"first",L"第一条",L"日志",L"network, error"},{L"other",L"其他",L"",L""},{L"last",L"最后",L"日志",L"NETWORK, warning"}};
+    assert(save(config,entries));refresh();
+    int category=(int)SendMessageW(GetDlgItem(panel,33),CB_FINDSTRINGEXACT,-1,(LPARAM)L"日志");assert(category>=2);
+    SendMessageW(GetDlgItem(panel,33),CB_SETCURSEL,category,0);SendMessageW(panel,WM_COMMAND,MAKEWPARAM(33,CBN_SELCHANGE),0);
+    assert((visibleRows==std::vector<int>{0,2}));
+    assert(!GetDlgItem(panel,34) && Header_GetItemCount(ListView_GetHeader(choices))==3);
+    assert(editEntry(sourceRow(1),{L"renamed",L"已修改",L" 其他分类 ",L"网络， 网络; FATAL;fatal"})==EditResult::Success);
+    assert(entries.size()==3 && entries[2].keyword==L"renamed" && entries[2].category==L"其他分类" && entries[2].tags==L"NETWORK, warning");
+    assert((visibleRows==std::vector<int>{0}));
+    assert(editEntry(2,{L"first",L"冲突"})==EditResult::Duplicate && entries[2].keyword==L"renamed");
+    assert(editEntry(2,{L"",L""})==EditResult::Invalid);
+    validConfig=config;config+=L"\\missing.ini";assert(editEntry(2,{L"lost",L""})==EditResult::SaveFailed);config=validConfig;
+    assert(entries[2].keyword==L"renamed");
+    SetWindowTextW(GetDlgItem(w,FIND),L"renamed");SetWindowTextW(description,L"快捷更新");SendMessageW(panel,WM_COMMAND,MAKEWPARAM(12,BN_CLICKED),0);
+    assert(entries[2].category==L"其他分类" && entries[2].tags==L"NETWORK, warning" && entries[2].description==L"快捷更新");
+    assert(load(config,persisted) && persisted[2].tags==L"NETWORK, warning");
+    SendMessageW(panel,WM_COMMAND,MAKEWPARAM(32,BN_CLICKED),0);assert(visibleRows.size()==3);
+    SendMessageW(GetDlgItem(panel,33),CB_SETCURSEL,1,0);SendMessageW(panel,WM_COMMAND,MAKEWPARAM(33,CBN_SELCHANGE),0);assert((visibleRows==std::vector<int>{1}));
+    SendMessageW(panel,WM_COMMAND,MAKEWPARAM(32,BN_CLICKED),0);
+    editOwner=w;ListView_SetItemState(choices,-1,0,LVIS_SELECTED);ListView_SetItemState(choices,2,LVIS_SELECTED,LVIS_SELECTED);
+    std::cout<<"Testing editor modal save..."<<std::endl;
+    assert(SetTimer(nullptr,0,20,completeTestEditor));editSelected();
+    assert(entries.size()==3 && entries[2].keyword==L"modal-renamed" && entries[2].category==L"弹框分类" && entries[2].tags==L"NETWORK, warning");
+    cancelModal=true;assert(SetTimer(nullptr,0,20,completeTestEditor));editSelected();
+    assert(entries[2].keyword==L"modal-renamed" && entries.size()==3);
+    DeleteFileW(config.c_str());
     auto current=rect(below,w); assert(EqualRect(&initial,&current));
     DestroyWindow(w); assert(!dialog && !panelBrush);
-    std::cout<<"PASS: case-insensitive/literal/Chinese column filters and AND combination; empty/reset results; filtered double-click, save and batch deletion preserve hidden rows; resize, collapse, fonts and previous regressions\n";
+    std::cout<<"PASS: no tag controls/column; category filtering and editing; edit original filtered row, duplicate/failure protection and metadata preservation; prior filtering, deletion, resize and collapse regressions\n";
 }
