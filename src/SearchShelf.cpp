@@ -153,6 +153,37 @@ static bool deleteRows(const std::vector<int>& selected) {
     SetWindowTextW(description,L"");
     return true;
 }
+enum class ImportResult { Success, TooManyEntries, SaveFailed };
+static ImportResult importEntries(const std::vector<Entry>& incoming, bool replace) {
+    auto updated=replace?std::vector<Entry>{}:entries;
+    for(const auto& e:incoming)
+        if(std::none_of(updated.begin(),updated.end(),[&](const auto& x){return x.keyword==e.keyword;})) updated.push_back(e);
+    if(updated.size()>1000) return ImportResult::TooManyEntries;
+    if(!save(config,updated)) return ImportResult::SaveFailed;
+    entries=std::move(updated); refresh(); SetWindowTextW(description,L"");
+    return ImportResult::Success;
+}
+static int chooseImportMode(size_t incomingCount) {
+    HWND owner=dialog?dialog:host.npp;
+    auto summary=L"现有收藏："+std::to_wstring(entries.size())+L" 条；导入文件："+std::to_wstring(incomingCount)+L" 条。\n追加时按关键词完全相同去重，优先保留已有内容。";
+    // Resolve dynamically so hosts without common-controls v6 still load.
+    using TaskDialogFn=HRESULT(WINAPI*)(const TASKDIALOGCONFIG*,int*,int*,BOOL*);
+    auto taskDialog=(TaskDialogFn)GetProcAddress(GetModuleHandleW(L"comctl32.dll"),"TaskDialogIndirect");
+    if(taskDialog) {
+        TASKDIALOG_BUTTON buttons[]={{1001,L"追加导入\n保留已有收藏，仅添加新的关键词"},
+                                    {1002,L"覆盖导入\n清空已有收藏，替换为导入文件中的内容"}};
+        TASKDIALOGCONFIG prompt{};prompt.cbSize=sizeof(prompt);prompt.hwndParent=owner;
+        prompt.dwFlags=TDF_USE_COMMAND_LINKS|TDF_ALLOW_DIALOG_CANCELLATION|TDF_POSITION_RELATIVE_TO_WINDOW;
+        prompt.dwCommonButtons=TDCBF_CANCEL_BUTTON;prompt.pszWindowTitle=L"导入搜索收藏";
+        prompt.pszMainInstruction=L"请选择导入方式";prompt.pszContent=summary.c_str();
+        prompt.cButtons=2;prompt.pButtons=buttons;prompt.nDefaultButton=1001;
+        int chosen=IDCANCEL;
+        if(SUCCEEDED(taskDialog(&prompt,&chosen,nullptr,nullptr))) return chosen;
+    }
+    auto message=summary+L"\n\n是：覆盖导入（替换全部现有收藏）\n否：追加导入（保留已有收藏）\n取消：不导入";
+    int choice=MessageBoxW(owner,message.c_str(),L"选择导入方式",MB_YESNOCANCEL|MB_DEFBUTTON2|MB_ICONQUESTION);
+    return choice==IDYES?1002:choice==IDNO?1001:IDCANCEL;
+}
 static void transfer(bool importing) {
     wchar_t path[MAX_PATH]=L"SearchShelf.ini";
     OPENFILENAMEW ofn{sizeof(ofn)}; ofn.hwndOwner=dialog?dialog:host.npp; ofn.lpstrFilter=L"搜索收藏 (*.ini)\0*.ini\0\0"; ofn.lpstrFile=path; ofn.nMaxFile=MAX_PATH; ofn.lpstrDefExt=L"ini"; ofn.Flags=OFN_NOCHANGEDIR|OFN_PATHMUSTEXIST|(importing?OFN_FILEMUSTEXIST:OFN_OVERWRITEPROMPT);
@@ -160,11 +191,11 @@ static void transfer(bool importing) {
     if(!importing) { if(!save(path,entries)) error(L"导出失败，请检查文件写入权限。"); return; }
     std::vector<Entry> incoming;
     if(!load(path,incoming)) { error(L"配置格式不正确，未更改现有收藏。"); return; }
-    auto merged=entries;
-    for(auto& e:incoming) if(std::none_of(merged.begin(),merged.end(),[&](auto& x){return x.keyword==e.keyword;})) merged.push_back(e);
-    if(merged.size()>1000) { error(L"最多支持 1000 条收藏。"); return; }
-    if(!save(config,merged)) { error(L"保存失败，未更改现有收藏。"); return; }
-    entries=std::move(merged); refresh();
+    int mode=chooseImportMode(incoming.size());
+    if(mode!=1001 && mode!=1002) return;
+    auto result=importEntries(incoming,mode==1002);
+    if(result==ImportResult::TooManyEntries) error(L"最多支持 1000 条收藏，未更改现有收藏。");
+    if(result==ImportResult::SaveFailed) error(L"保存失败，未更改现有收藏。");
 }
 static LRESULT CALLBACK panelProc(HWND w,UINT m,WPARAM wp,LPARAM lp) {
     if(m==WM_ERASEBKGND && panelBrush) {
